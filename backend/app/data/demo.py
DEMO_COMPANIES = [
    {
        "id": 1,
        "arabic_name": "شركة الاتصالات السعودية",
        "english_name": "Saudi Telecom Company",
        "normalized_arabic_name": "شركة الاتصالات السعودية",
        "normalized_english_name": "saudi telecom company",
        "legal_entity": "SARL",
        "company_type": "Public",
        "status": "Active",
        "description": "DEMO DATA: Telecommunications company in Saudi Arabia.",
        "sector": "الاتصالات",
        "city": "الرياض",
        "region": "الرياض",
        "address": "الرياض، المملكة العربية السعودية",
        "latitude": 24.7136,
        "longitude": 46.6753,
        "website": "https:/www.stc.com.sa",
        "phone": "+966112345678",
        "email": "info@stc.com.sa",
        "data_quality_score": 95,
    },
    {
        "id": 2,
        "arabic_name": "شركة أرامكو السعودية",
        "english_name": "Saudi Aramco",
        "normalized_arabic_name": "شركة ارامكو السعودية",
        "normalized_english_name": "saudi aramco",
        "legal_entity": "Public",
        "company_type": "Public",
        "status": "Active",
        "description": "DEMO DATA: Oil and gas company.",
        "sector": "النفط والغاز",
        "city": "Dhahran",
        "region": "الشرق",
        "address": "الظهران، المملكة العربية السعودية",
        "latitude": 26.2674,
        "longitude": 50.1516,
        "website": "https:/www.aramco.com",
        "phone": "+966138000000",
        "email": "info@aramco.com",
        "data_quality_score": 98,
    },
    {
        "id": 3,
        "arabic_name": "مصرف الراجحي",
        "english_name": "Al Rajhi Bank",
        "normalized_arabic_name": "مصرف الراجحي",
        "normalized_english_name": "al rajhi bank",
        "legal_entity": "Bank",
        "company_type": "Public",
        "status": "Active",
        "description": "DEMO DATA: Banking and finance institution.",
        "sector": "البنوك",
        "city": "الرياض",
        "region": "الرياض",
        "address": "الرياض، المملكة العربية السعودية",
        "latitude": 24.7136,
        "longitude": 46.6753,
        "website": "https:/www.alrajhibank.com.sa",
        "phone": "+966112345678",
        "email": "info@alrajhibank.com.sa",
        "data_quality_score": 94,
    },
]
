@@ -1,0 +1,312 @@
+from __future__ import annotations
+
+import math
+import re
+from typing import Any, Dict, List, Optional
+
+from fastapi import FastAPI, Query, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from sqlalchemy.orm import Session
+
+from app.core.config import settings
+from app.core.database import Base, engine, get_db
+from app.models import (
+    Activity,
+    Branch,
+    City,
+    CommercialRegistration,
+    Company,
+    CompanyActivity,
+    CompanySource,
+    Region,
+    Sector,
+    Source,
+)
+from app.services.normalization import normalize_arabic, normalize_query
+from app.services.search import SearchService
+from app.services.cache import cache_service
+from app.services.import_pipeline import DataImportPipeline
+from app.data.demo import DEMO_COMPANIES
+
+app = FastAPI(
+    title="Saudi Companies Encyclopedia API",
+    version="1.0.0",
+    docs_url="/docs",
+    openapi_url="/openapi.json",
+    description="REST API for the Saudi Companies Encyclopedia and company directory.",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_origins.split(","),
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.on_event("startup")
+def startup_event() -> None:
+    Base.metadata.create_all(bind=engine)
+
+
+@app.get("/api/v1/health")
+def health() -> dict[str, str]:
+    return {"status": "ok"}
+
+
+@app.get("/api/v1/companies")
+def list_companies(
+    q: Optional[str] = None,
+    sector: Optional[str] = None,
+    activity: Optional[str] = None,
+    city: Optional[str] = None,
+    region: Optional[str] = None,
+    company_type: Optional[str] = None,
+    status: Optional[str] = None,
+    page: int = 1,
+    page_size: int = 20,
+    sort: str = "relevance",
+    db: Session = Depends(get_db),
+):
+    cache_key = f"companies:{q}:{sector}:{activity}:{city}:{region}:{company_type}:{status}:{page}:{page_size}:{sort}"
+    cached = cache_service.get(cache_key)
+    if cached:
+        return cached
+
+    total = 0
+    items = []
+
+    query = db.query(Company)
+    if q:
+        nq = normalize_query(q)
+        query = query.filter(
+            (Company.arabic_name.ilike(f"%{q}%"))
+            | (Company.english_name.ilike(f"%{q}%"))
+            | (Company.normalized_arabic_name.like(f"%{nq}%"))
+        )
+    if sector:
+        query = query.join(Sector).filter(Sector.name.ilike(f"%{sector}%"))
+    if city:
+        query = query.join(City).filter(City.name.ilike(f"%{city}%"))
+    if region:
+        query = query.join(Region).filter(Region.name.ilike(f"%{region}%"))
+    if company_type:
+        query = query.filter(Company.company_type.ilike(f"%{company_type}%"))
+    if status:
+        query = query.filter(Company.status.ilike(f"%{status}%"))
+
+    total = query.count()
+    offset = (page - 1) * page_size
+    rows = query.order_by(Company.updated_at.desc()).offset(offset).limit(page_size).all()
+
+    for row in rows:
+        items.append({
+            "id": row.id,
+            "arabic_name": row.arabic_name,
+            "english_name": row.english_name,
+            "sector": row.sector.name if row.sector else None,
+            "city": row.city.name if row.city else None,
+            "company_type": row.company_type,
+            "status": row.status,
+            "website": row.website,
+            "branch_count": db.query(Branch).filter(Branch.company_id == row.id).count(),
+            "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+            "source_id": row.source_id,
+        })
+
+    response = {
+        "items": items,
+        "page": page,
+        "page_size": page_size,
+        "total": total,
+        "total_pages": max(1, math.ceil(total / page_size)) if total else 0,
+    }
+    cache_service.set(cache_key, response, ttl=300)
+    return response
+
+
+@app.get("/api/v1/companies/{company_id}")
+def company_detail(company_id: int, db: Session = Depends(get_db)):
+    company = db.query(Company).filter(Company.id == company_id).first()
+    if not company:
+        raise HTTPException(status_code=404, detail="Company not found")
+    return {
+        "id": company.id,
+        "arabic_name": company.arabic_name,
+        "english_name": company.english_name,
+        "legal_entity": company.legal_entity,
+        "company_type": company.company_type,
+        "status": company.status,
+        "description": company.description,
+        "sector": company.sector.name if company.sector else None,
+        "city": company.city.name if company.city else None,
+        "region": company.region.name if company.region else None,
+        "address": company.address,
+        "latitude": company.latitude,
+        "longitude": company.longitude,
+        "website": company.website,
+        "phone": company.phone,
+        "email": company.email,
+        "last_verified_at": company.last_verified_at.isoformat() if company.last_verified_at else None,
+        "data_quality_score": company.data_quality_score,
+        "updated_at": company.updated_at.isoformat() if company.updated_at else None,
+    }
+
+
+@app.get("/api/v1/companies/{company_id}/branches")
+def company_branches(company_id: int, db: Session = Depends(get_db)):
+    rows = db.query(Branch).filter(Branch.company_id == company_id).all()
+    return [{
+        "id": row.id,
+        "branch_name": row.branch_name,
+        "city": row.city.name if row.city else None,
+        "region": row.region.name if row.region else None,
+        "address": row.address,
+        "latitude": row.latitude,
+        "longitude": row.longitude,
+        "phone": row.phone,
+        "website": row.website,
+        "status": row.status,
+    } for row in rows]
+
+
+@app.get("/api/v1/companies/{company_id}/activities")
+def company_activities(company_id: int, db: Session = Depends(get_db)):
+    company = db.query(Company).filter(Company.id == company_id).first()
+    if not company:
+        raise HTTPException(status_code=404, detail="Company not found")
+    return [{"id": a.id, "name": a.name} for a in company.activities]
+
+
+@app.get("/api/v1/companies/{company_id}/sources")
+def company_sources(company_id: int, db: Session = Depends(get_db)):
+    rows = db.query(CompanySource).filter(CompanySource.company_id == company_id).all()
+    return [{
+        "id": row.id,
+        "source_id": row.source_id,
+        "source_name": row.source.name if row.source else None,
+        "source_type": row.source.source_type if row.source else None,
+    } for row in rows]
+
+
+@app.get("/api/v1/companies/nearby")
+def nearby_companies(
+    latitude: float = Query(...),
+    longitude: float = Query(...),
+    radius: float = Query(..., description="Radius in meters"),
+    page: int = 1,
+    page_size: int = 20,
+    db: Session = Depends(get_db),
+):
+    # Demo fallback using simple Euclidean approximation for distance; PostGIS will be used in production.
+    rows = db.query(Company).filter(Company.latitude.isnot(None), Company.longitude.isnot(None)).all()
+    matches = []
+    for company in rows:
+        if company.latitude is None or company.longitude is None:
+            continue
+        distance = ((company.latitude - latitude) ** 2 + (company.longitude - longitude) ** 2) ** 0.5 * 111000
+        if distance <= radius:
+            matches.append({
+                "id": company.id,
+                "arabic_name": company.arabic_name,
+                "english_name": company.english_name,
+                "latitude": company.latitude,
+                "longitude": company.longitude,
+                "distance_meters": round(distance, 2),
+            })
+    matches.sort(key=lambda x: x["distance_meters"])
+    total = len(matches)
+    start = (page - 1) * page_size
+    items = matches[start:start + page_size]
+    return {
+        "items": items,
+        "page": page,
+        "page_size": page_size,
+        "total": total,
+        "total_pages": max(0, math.ceil(total / page_size)) if total else 0,
+    }
+
+
+@app.get("/api/v1/sectors")
+def list_sectors(db: Session = Depends(get_db)):
+    rows = db.query(Sector).all()
+    return [{"id": s.id, "name": s.name, "description": s.description} for s in rows]
+
+
+@app.get("/api/v1/sectors/{sector_id}")
+def get_sector(sector_id: int, db: Session = Depends(get_db)):
+    row = db.query(Sector).filter(Sector.id == sector_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Sector not found")
+    return {"id": row.id, "name": row.name, "description": row.description}
+
+
+@app.get("/api/v1/cities")
+def list_cities(db: Session = Depends(get_db)):
+    rows = db.query(City).all()
+    return [{"id": c.id, "name": c.name, "region_id": c.region_id} for c in rows]
+
+
+@app.get("/api/v1/cities/{city_id}")
+def get_city(city_id: int, db: Session = Depends(get_db)):
+    row = db.query(City).filter(City.id == city_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="City not found")
+    return {"id": row.id, "name": row.name, "region_id": row.region_id}
+
+
+@app.get("/api/v1/regions")
+def list_regions(db: Session = Depends(get_db)):
+    rows = db.query(Region).all()
+    return [{"id": r.id, "name": r.name} for r in rows]
+
+
+@app.get("/api/v1/regions/{region_id}")
+def get_region(region_id: int, db: Session = Depends(get_db)):
+    row = db.query(Region).filter(Region.id == region_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Region not found")
+    return {"id": row.id, "name": row.name}
+
+
+@app.get("/api/v1/activities")
+def list_activities(db: Session = Depends(get_db)):
+    rows = db.query(Activity).all()
+    return [{"id": a.id, "name": a.name} for a in rows]
+
+
+@app.get("/api/v1/activities/{activity_id}")
+def get_activity(activity_id: int, db: Session = Depends(get_db)):
+    row = db.query(Activity).filter(Activity.id == activity_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Activity not found")
+    return {"id": row.id, "name": row.name}
+
+
+@app.get("/api/v1/search/suggestions")
+def search_suggestions(q: str = Query(..., min_length=1), db: Session = Depends(get_db)):
+    query = normalize_query(q)
+    items = db.query(Company).filter(
+        Company.normalized_arabic_name.ilike(f"%{query}%")
+        | Company.normalized_english_name.ilike(f"%{query}%")
+        | Company.arabic_name.ilike(f"%{q}%")
+    ).limit(10).all()
+    return [
+        {"id": item.id, "label": item.arabic_name, "english_name": item.english_name}
+        for item in items
+    ]
+
+
+@app.get("/api/v1/demo")
+def demo_companies():
+    return DEMO_COMPANIES
+
+
+@app.get("/api/v1/import-status")
+def import_status():
+    return {"status": "ready", "demo_mode": True}
+
+
+app.include_router(SearchService().router, prefix="/api/v1")
